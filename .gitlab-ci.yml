@@ -1,0 +1,17 @@
+variables:
+  KOJI_TARGET: 'hw7'
+
+stages:
+  - build
+
+build_srpm:
+  stage: build
+  script:
+      - yum install -y rpm-build rpmdevtools make tar python-devel
+      - make -f Makefile.koji srpm
+
+build_rpm:
+  stage: build
+  script:
+    - yum install -y rpm-build rpmdevtools make tar python-devel
+    - make -f Makefile.koji rpm

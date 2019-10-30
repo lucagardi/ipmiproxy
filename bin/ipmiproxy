@@ -1,18 +1,25 @@
-#!/usr/bin/env python3
+#!/usr/bin/python
 # -*- coding: utf-8 -*-
+from __future__ import print_function
 
+from errno import ESRCH
 from fcntl import F_GETFL, F_SETFL, fcntl
-from os import O_NONBLOCK, pipe
+from os import O_NONBLOCK, fdopen, pipe
 from subprocess import Popen
-from sys import stderr, stdout, argv
+from sys import argv, stderr, stdout
 from threading import Thread
 from time import sleep
 
+from six import PY2
+
+if PY2:
+    # This is defined only on Python 3
+    ProcessLookupError = None
 
 class IPMIStreamExc(Thread):
     """ Pipe handler that can call it's origin in case of certain output. """
     def __init__(self, origin, pid, output=stderr):
-        super().__init__()
+        super(IPMIStreamExc, self).__init__()
         
         # Origin represents call handler that has spawned the instance
         self.origin = origin
@@ -25,13 +32,13 @@ class IPMIStreamExc(Thread):
         self.output = output
         self.name = self.output.name, str(self)
 
-        # Retrieve a pipe file handler, to read and write
-        self.read, self.write = pipe()
+        # Retrieve a pipe file handle, to read and write
+        self.read_file_handle, self.write_file_handle = pipe()
 
         # Open the read pipe file handler to read content.
         # Read carefully the next comment paragraph to see
         # how open() behaviour has been altered.
-        self.content = open(self.read)
+        self.content = fdopen(self.read_file_handle)
 
         # From stdio library man (https://linux.die.net/man/3/read):
         #   When attempting to read from an empty pipe or FIFO:
@@ -46,7 +53,6 @@ class IPMIStreamExc(Thread):
         #
         # Therefore, unless O_NONBLOCK is set (default python behavior),
         # any self.content.read() call will block until new data arrives.
-        #
         # Looking at Python's fileio source code, O_NONBLOCK is never set:
         # https://hg.python.org/cpython/file/3a1db0d2747e/Modules/_io/fileio.c#l176
         #
@@ -54,8 +60,6 @@ class IPMIStreamExc(Thread):
         # manually through the fcntl module:
         file_flags = fcntl(self.content, F_GETFL)
         fcntl(self.content, F_SETFL, file_flags | O_NONBLOCK)
-
-        # print(self.name, 'read_handler:', self.read, 'content:', self.content, file=self.output)
 
         # Run until we're done
         self.done = False
@@ -66,14 +70,20 @@ class IPMIStreamExc(Thread):
     def fileno(self):
         """ Mock subprocess.PIPE behaviour and return the write file
             descriptor from os.pipe() """
-        return self.write
+        return self.write_file_handle
     
     def run(self):
         """ Runs the thread, writing in the buffer and communicating with
             origin in case of exception. """
         while not self.done:
-            # Read content from read-only os.pipe() file descriptor
-            line = self.content.readline()
+            line = None
+
+            # Try reading content from read-only os.pipe() file descriptor
+            try:
+                line = self.content.readline()
+            except IOError:
+                # The resource is temporarily unavailable, only in python2
+                pass
 
             # Check if any content was available
             if not line:
@@ -118,6 +128,8 @@ class IPMIStreamExc(Thread):
 
 
 class IPMICommand():
+    IPMITOOL_PATH = '/usr/bin/ipmitool'
+
     def __init__(self, arguments=[], lanplus=None, cipher=None):
         # CLI arguments originally intended for ipmitool
         self.arguments = arguments
@@ -137,7 +149,12 @@ class IPMICommand():
         try:
             self.processes[pid].send_signal(15)
         except (ProcessLookupError, IndexError):
+            # Only python3 raises ProcessLookupError
             pass
+        except OSError as e:
+            if e.errno == ESRCH:
+                # Python2 equivalent to ProcessLookupError
+                pass
 
         # Add LAN+ channel setting to connection arguments
         self.lanplus = True
@@ -148,7 +165,12 @@ class IPMICommand():
         try:
             self.processes[pid].send_signal(15)
         except (ProcessLookupError, IndexError):
+            # Only python3 raises ProcessLookupError
             pass
+        except OSError as e:
+            if e.errno == ESRCH:
+                # Python2 equivalent to ProcessLookupError
+                pass
 
         # Set connection cipher to cipher 17
         self.cipher = '17'
@@ -170,12 +192,14 @@ class IPMICommand():
         stderr_handler = IPMIStreamExc(self, len(self.processes), stderr)
         stdout_handler = IPMIStreamExc(self, len(self.processes), stdout)
 
+        # Build the command string
+        cmd_str = [self.IPMITOOL_PATH]
+        cmd_str.extend(lanplus)
+        cmd_str.extend(cipher)
+        cmd_str.extend(self.arguments)
+
         # Launch command and let the stream handlers propagate the output
-        cmd = Popen(['/usr/bin/ipmitool',
-                     *lanplus,
-                     *cipher,
-                     *self.arguments],
-                    bufsize=0,
+        cmd = Popen(cmd_str, bufsize=0,
                     stderr=stderr_handler,
                     stdout=stdout_handler)
 

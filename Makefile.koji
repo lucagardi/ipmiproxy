@@ -1,0 +1,61 @@
+.SILENT: bump
+SPECFILE = ipmiproxy.spec
+REPO = git+ssh://git@gitlab.cern.ch:7999/hw/ipmiproxy.git
+PACKAGE=$(shell grep -s '^Name'    $(SPECFILE) | sed -e 's/Name: *//')
+VERSION=$(shell grep -s '^Version' $(SPECFILE) | sed -e 's/Version: *//')
+RELEASE=$(shell grep -s '^Release' $(SPECFILE) | sed -e 's/Release: *//' | sed -e 's/%{?dist}//')
+PKGNAME=$(PACKAGE)-$(VERSION)
+TARFILE=$(PKGNAME).tar.gz
+
+
+all:
+	rm -rf /tmp/$(PKGNAME)
+	mkdir /tmp/$(PKGNAME)
+	cp -rv * /tmp/$(PKGNAME)/
+	pwd ; ls -l
+	cd /tmp ; tar --exclude .svn --exclude .git -czf $(TARFILE) $(PKGNAME)
+	mv /tmp/$(TARFILE) .
+	rm -rf /tmp/$(PKGNAME)
+clean:
+	rm *.tar.gz
+srpm: all
+	rpmbuild -bb --define '_sourcedir $(PWD)' ${SPECFILE}
+rpm: all
+	rpmbuild -bb --define '_sourcedir $(PWD)' ${SPECFILE}
+
+scratch:
+	koji build hw7 --nowait --scratch $(REPO)#$(shell git rev-parse HEAD)
+
+build:
+	koji build hw7 --nowait $(REPO)#$(VERSION)-$(RELEASE)
+
+tag-qa:
+	koji tag-build hw7-qa $(PACKAGE)-$(VERSION)-$(RELEASE).el7
+
+tag-stable:
+	koji tag-build hw7-stable $(PACKAGE)-$(VERSION)-$(RELEASE).el7
+
+git-tag:
+	git tag -a $(VERSION)-$(RELEASE) -m ''
+	git push origin $(VERSION)-$(RELEASE)
+
+BUMP_VERSION=$(shell python -c "exec(\"from datetime import datetime as dt;print '{}.{}.{}'.format(str(dt.now().year)[2:], dt.now().month, ((dt.now().day-1)//7+1))\")" )
+BUMP_RELEASE=$(shell expr $(RELEASE) + 1)
+BUMP_LATEST_TAG=$(shell git describe --abbrev=0 --tags)
+bump:
+	# Update setup.py version
+	sed -i -r "s/(\s+version=')(.*)(',)/\1$(BUMP_VERSION)\3/" setup.py
+
+	# Update specfile version and release
+	if [ "$(VERSION)" = "$(BUMP_VERSION)" ]; then \
+		echo "Bumped $(VERSION)-$(RELEASE) to $(BUMP_VERSION)-$(BUMP_RELEASE)"; \
+		sed -i -r "s/(Release:\s+)([0-9]+)/\1$(BUMP_RELEASE)/" $(SPECFILE); \
+	else \
+		echo "Bumped $(VERSION)-$(RELEASE) to $(BUMP_VERSION)-1"; \
+		sed -i -r "s/(Version:\s+)(.*)/\1$(BUMP_VERSION)/" $(SPECFILE); \
+		sed -i -r "s/(Release:\s+)([0-9]+)/\11/" $(SPECFILE); \
+		BUMP_RELEASE=1; \
+	fi 
+	echo "------------- PROPOSED CHANGELOG -------------"
+	echo "*" $(shell python -c "exec(\"from datetime import datetime as dt;print dt.now().strftime('%a %b %d %Y') \")") - $(shell git config user.name) "<$(shell git config user.email)> -" $(BUMP_VERSION)-$(BUMP_RELEASE)
+	git log --pretty=%s $(BUMP_LATEST_TAG).. | sed 's/^/- /'
