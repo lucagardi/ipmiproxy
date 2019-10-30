@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from fcntl import F_GETFL, F_SETFL, fcntl
+from os import O_NONBLOCK, pipe
+from subprocess import Popen
+from sys import stderr, stdout, argv
+from threading import Thread
+from time import sleep
+
+
+class IPMIStreamExc(Thread):
+    """ Pipe handler that can call it's origin in case of certain output. """
+    def __init__(self, origin, pid, output=stderr):
+        super().__init__()
+        
+        # Origin represents call handler that has spawned the instance
+        self.origin = origin
+
+        # PID refers to the sequencial index of the processed of the
+        # origin command
+        self.pid = pid
+
+        # Set the output file descriptor
+        self.output = output
+        self.name = self.output.name, str(self)
+
+        # Retrieve a pipe file handler, to read and write
+        self.read, self.write = pipe()
+
+        # Open the read pipe file handler to read content.
+        # Read carefully the next comment paragraph to see
+        # how open() behaviour has been altered.
+        self.content = open(self.read)
+
+        # From stdio library man (https://linux.die.net/man/3/read):
+        #   When attempting to read from an empty pipe or FIFO:
+        #     - if no process has the pipe open for writing, read() shall
+        #       return 0 to indicate end-of-file.
+        #     - if some process has the pipe open for writing and O_NONBLOCK
+        #       is set, read() shall return -1 and set errno to [EAGAIN].
+        #     - if some process has the pipe open for writing and O_NONBLOCK
+        #       is clear, read() shall block the calling thread until some
+        #       data is written or the pipe is closed by all processes that
+        #       had the pipe open for writing.
+        #
+        # Therefore, unless O_NONBLOCK is set (default python behavior),
+        # any self.content.read() call will block until new data arrives.
+        #
+        # Looking at Python's fileio source code, O_NONBLOCK is never set:
+        # https://hg.python.org/cpython/file/3a1db0d2747e/Modules/_io/fileio.c#l176
+        #
+        # Luckily Python allows us to to manually set the O_NONBLOCK flag
+        # manually through the fcntl module:
+        file_flags = fcntl(self.content, F_GETFL)
+        fcntl(self.content, F_SETFL, file_flags | O_NONBLOCK)
+
+        # print(self.name, 'read_handler:', self.read, 'content:', self.content, file=self.output)
+
+        # Run until we're done
+        self.done = False
+
+        # Wait for data and start checking the output for known exceptions
+        self.start()
+
+    def fileno(self):
+        """ Mock subprocess.PIPE behaviour and return the write file
+            descriptor from os.pipe() """
+        return self.write
+    
+    def run(self):
+        """ Runs the thread, writing in the buffer and communicating with
+            origin in case of exception. """
+        while not self.done:
+            # Read content from read-only os.pipe() file descriptor
+            line = self.content.readline()
+
+            # Check if any content was available
+            if not line:
+                try:
+                    # No content was available, check origin process status
+                    return_code = self.origin.get_return_code(self.pid)
+
+                    if return_code is None:
+                        # Origin process still running, wait for more output
+                        self.done = False
+                    else:
+                        # Origin process has terminated, pass this object to the GC
+                        self.done = True
+                        break
+                except IndexError:
+                    # The process still hasn't been appended 
+                    # to the list of processes
+                    pass
+
+                # Sleep a quid, this seems to be critical...
+                sleep(0.0001)
+                continue
+
+            # Apply here any pipe interception and subsequent actions.
+
+            # Intercept LANPLUS issue
+            if 'Authentication type NONE' in line:
+                self.origin.exc_lanplus(self.pid)
+                break
+
+            # Intercept C17 issue
+            if 'Error in open session response message : insufficient '\
+               'resources for session' in line:
+                self.origin.exc_c_seventeen(self.pid)
+                break
+
+            # Send output to current file handler
+            self.output.write(line)
+
+        # Close local read only file descriptor
+        self.content.close()
+
+
+class IPMICommand():
+    def __init__(self, arguments=[], lanplus=None, cipher=None):
+        # CLI arguments originally intended for ipmitool
+        self.arguments = arguments
+
+        #  Hold for internal state exception applied
+        self.lanplus = lanplus
+        self.cipher = cipher
+
+        # Hold an ipmitool processes internal list
+        self.processes = []
+
+        # Start the thread
+        self.run()
+
+    def exc_lanplus(self, pid):
+        # Silently pass on termination failure
+        try:
+            self.processes[pid].send_signal(15)
+        except (ProcessLookupError, IndexError):
+            pass
+
+        # Add LAN+ channel setting to connection arguments
+        self.lanplus = True
+        self.run()
+
+    def exc_c_seventeen(self, pid):
+        # Silently pass on termination failure
+        try:
+            self.processes[pid].send_signal(15)
+        except (ProcessLookupError, IndexError):
+            pass
+
+        # Set connection cipher to cipher 17
+        self.cipher = '17'
+        self.run()
+
+    def get_return_code(self, process_key):
+        """ Retrieve the return code of a process in the process list. """
+        self.processes[process_key].poll()
+        return self.processes[process_key].returncode
+
+    def run(self):
+        """ Execute ipmitool and delegate the command stderr and stdout 
+            to the IPMIStreamExc handlers. """
+        # Build commands
+        cipher  = ['-C', self.cipher] if self.cipher  else []
+        lanplus = ['-I', 'lanplus']   if self.lanplus else []
+
+        # Build stream handlers
+        stderr_handler = IPMIStreamExc(self, len(self.processes), stderr)
+        stdout_handler = IPMIStreamExc(self, len(self.processes), stdout)
+
+        # Launch command and let the stream handlers propagate the output
+        cmd = Popen(['/usr/bin/ipmitool',
+                     *lanplus,
+                     *cipher,
+                     *self.arguments],
+                    bufsize=0,
+                    stderr=stderr_handler,
+                    stdout=stdout_handler)
+
+        # Append the command object to the internal list of processes
+        self.processes.append(cmd)
+                
+if __name__ == '__main__':
+    # Retrieve arguments and pass them to an IPMICommand instance
+    cmd = IPMICommand(argv[1:])
