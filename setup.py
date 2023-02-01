@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='ipmiproxy',
-    version='19.10.4',
+    version='21.12.1',
     description="Python wrapper around ipmitool",
     classifiers=[
         "Development Status :: 4 - Beta",
